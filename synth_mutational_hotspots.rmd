@@ -1,0 +1,467 @@
+---
+title: "Synthetic generation of mutational hotspots"
+author: "CEDAR-Ellrott: EAG script for multimodal integration project"
+date: "April 25, 2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Overview
+
+This notebook generates synthetic mutational hotspot data by downloading real TCGA data from the GDC Portal then adding noise. 
+If downloading fails, it creates realistic mock data instead.
+
+## Step 1: Set up
+
+```{r}
+# Load required libraries
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(readr)
+library(httr)
+library(jsonlite)
+library(R.utils)
+
+# Helper function for NULL coalescing
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+download_or_create_mutation_data <- function(cancer_type = "LUAD", output_file = "mutation_data.tsv") {
+  cat(sprintf("Creating realistic mutation data for %s...\n", cancer_type))
+  
+  # Common cancer genes with their chromosomes
+  genes <- list(
+    TP53 = "17",
+    KRAS = "12",
+    EGFR = "7",
+    BRAF = "7",
+    PIK3CA = "3",
+    APC = "5",
+    PTEN = "10",
+    RB1 = "13",
+    NF1 = "17",
+    BRCA1 = "17",
+    BRCA2 = "13"
+  )
+  
+  # Create realistic start positions for each gene
+  gene_positions <- list(
+    TP53 = 7675000,   # chr17
+    KRAS = 25380000,  # chr12
+    EGFR = 55080000,  # chr7
+    BRAF = 140450000, # chr7
+    PIK3CA = 178950000, # chr3
+    APC = 112100000,   # chr5
+    PTEN = 89620000,   # chr10
+    RB1 = 48880000,    # chr13
+    NF1 = 29420000,    # chr17
+    BRCA1 = 43080000,  # chr17
+    BRCA2 = 32920000   # chr13
+  )
+  
+  # Generate mutation data with hotspots (some positions will have more mutations)
+  num_samples <- 50  # 50 patient samples
+  mutations <- list()
+  
+  # For each sample
+  for (sample_id in 0:(num_samples-1)) {
+    sample_barcode <- sprintf("TCGA-%s-%04d", cancer_type, sample_id)
+    
+    # Decide how many mutations this sample will have (between 5 and 15)
+    num_mutations <- sample(5:15, 1)
+    
+    # Random mutations
+    for (i in 1:num_mutations) {
+      # Select a random gene (weighted to create hotspots)
+      if (runif(1) < 0.7) {  # 70% chance to pick common hotspot genes
+        gene <- sample(c("TP53", "KRAS", "EGFR"), 1)  # Common hotspot genes
+      } else {
+        gene <- sample(names(genes), 1)  # Any gene
+      }
+      
+      # Base position for the gene
+      base_pos <- gene_positions[[gene]]
+      
+      # Add slight position variation to create hotspots
+      # If we want a hotspot, keep position close to the base position
+      if (runif(1) < 0.6) {  # 60% chance for hotspot
+        pos_offset <- sample(-5:5, 1)  # Very close to base position
+      } else {
+        pos_offset <- sample(-1000:1000, 1)  # More variation
+      }
+      
+      position <- base_pos + pos_offset
+      
+      # Create the mutation record
+      mutation <- list(
+        Hugo_Symbol = gene,
+        Chromosome = genes[[gene]],
+        Start_Position = position,
+        Reference_Allele = sample(c("A", "C", "G", "T"), 1),
+        Tumor_Seq_Allele2 = sample(c("A", "C", "G", "T"), 1),
+        Variant_Classification = sample(c("Missense_Mutation", "Nonsense_Mutation", "Silent", "Splice_Site"), 1),
+        Variant_Type = "SNP",
+        Tumor_Sample_Barcode = sample_barcode
+      )
+      
+      mutations[[length(mutations) + 1]] <- mutation
+    }
+  }
+  
+  # Create dataframe
+  mutations_df <- do.call(rbind, lapply(mutations, function(x) {
+    data.frame(
+      Hugo_Symbol = x$Hugo_Symbol,
+      Chromosome = x$Chromosome,
+      Start_Position = x$Start_Position,
+      Reference_Allele = x$Reference_Allele,
+      Tumor_Seq_Allele2 = x$Tumor_Seq_Allele2,
+      Variant_Classification = x$Variant_Classification,
+      Variant_Type = x$Variant_Type,
+      Tumor_Sample_Barcode = x$Tumor_Sample_Barcode,
+      stringsAsFactors = FALSE
+    )
+  }))
+  
+  # Save to file
+  write_tsv(mutations_df, output_file)
+  cat(sprintf("Saved mutation data with %d mutations to %s\n", nrow(mutations_df), output_file))
+  
+  return(output_file)
+}
+```
+
+## Step 2: Define functions,identify hotspots and generate synthetic data
+
+```{r}
+identify_hotspots <- function(mutation_file, min_count = 2, output_file = NULL) {
+  cat(sprintf("Looking for mutation hotspots in %s...\n", mutation_file))
+
+  mutations <- read_tsv(mutation_file)
+  
+  # Group by gene, chromosome, and position to find hotspots
+  hotspot_counts <- mutations %>%
+    group_by(Hugo_Symbol, Chromosome, Start_Position) %>%
+    summarize(count = n(), .groups = "drop") %>%
+    arrange(desc(count))
+  
+  # Filter to include only positions with multiple mutations (hotspots)
+  hotspots <- hotspot_counts %>% filter(count >= min_count)
+  
+  cat(sprintf("Found %d hotspots with at least %d mutations\n", nrow(hotspots), min_count))
+  
+  # Save to file if output_file is provided
+  if (!is.null(output_file)) {
+    write_csv(hotspots, output_file)
+    cat(sprintf("Saved hotspots to %s\n", output_file))
+  }
+  
+  return(hotspots)
+}
+
+generate_synthetic_hotspot_data <- function(hotspots, num_samples = 10, noise_level = 0.2, output_file = NULL) {
+  cat(sprintf("Generating %d synthetic hotspot samples with noise level %.1f...\n", num_samples, noise_level))
+  
+  if (nrow(hotspots) == 0) {
+    cat("Error: No hotspots to work with. Make sure hotspots dataframe isn't empty.\n")
+    return(NULL)
+  }
+  
+  synthetic_samples <- list()
+  
+  for (i in 1:num_samples) {
+    # Create a copy of the hotspots
+    sample <- hotspots
+    
+    # Add random noise to counts
+    noise <- rnorm(nrow(sample), mean = 0, sd = noise_level * mean(sample$count))
+    sample$count <- pmax(1, as.integer(sample$count + noise))
+    
+    # Randomly add or remove a small percentage of positions
+    if (runif(1) < 0.5 && nrow(sample) > 10) {
+      # Remove some positions (up to 5% but at least 1)
+      drop_count <- max(1, as.integer(nrow(sample) * 0.05))
+      drop_indices <- sample(1:nrow(sample), drop_count)
+      sample <- sample[-drop_indices, ]
+    } else {
+      # Add some new positions by slightly modifying existing ones
+      add_count <- max(1, as.integer(nrow(sample) * 0.05))
+      if (add_count > 0) {
+        new_positions <- sample %>% 
+          sample_n(add_count, replace = TRUE) %>%
+          mutate(
+            Start_Position = Start_Position + sample(-100:100, n(), replace = TRUE),
+            count = sample(1:2, n(), replace = TRUE)
+          )
+        sample <- bind_rows(sample, new_positions)
+      }
+    }
+    
+
+    sample$sample_id <- sprintf("synthetic_sample_%d", i)
+    synthetic_samples[[i]] <- sample
+  }
+  
+  # Combine all synthetic samples
+  combined_synthetic <- bind_rows(synthetic_samples)
+  
+  # Save to file if output_file is provided
+  if (!is.null(output_file)) {
+    write_csv(combined_synthetic, output_file)
+    cat(sprintf("Saved %d synthetic hotspot data points to %s\n", 
+                nrow(combined_synthetic), output_file))
+  }
+  
+  return(combined_synthetic)
+}
+```
+
+#Step 3: GDC Data Download Function
+
+
+
+```{r}
+try_fetch_real_tcga_data <- function(cancer_type = "LUAD", 
+                                    data_type = "Masked Somatic Mutation", 
+                                    output_file = NULL,
+                                    token_file = NULL) {
+  tryCatch({
+    cat(sprintf("Trying to download real TCGA %s data for %s...\n", data_type, cancer_type))
+    
+    # Check if required packages are available
+    if (!requireNamespace("httr", quietly = TRUE)) {
+      stop("httr package is required for API access")
+    }
+    if (!requireNamespace("jsonlite", quietly = TRUE)) {
+      stop("jsonlite package is required for API access")
+    }
+    
+    # Set APIs
+    files_endpt <- "https://api.gdc.cancer.gov/files"
+    data_endpt <- "https://api.gdc.cancer.gov/data"
+    
+    # Read token if file provided
+    token <- NULL
+    if (!is.null(token_file) && file.exists(token_file)) {
+      token_content <- readLines(token_file, warn = FALSE)
+      if (length(token_content) > 0) {
+        token <- token_content[1]
+        token <- gsub("[\r\n]", "", token)  # Remove line breaks
+        cat("Using authentication token from file.\n")
+      }
+    }
+    
+    # Set up query parameters manually to minimize potential errors
+    filter_json <- paste0(
+      '{"op":"and","content":[',
+      '{"op":"in","content":{"field":"cases.project.project_id","value":["TCGA-', cancer_type, '"]}},',
+      '{"op":"in","content":{"field":"files.data_type","value":["', data_type, '"]}},',
+      '{"op":"in","content":{"field":"files.data_format","value":["MAF"]}},',
+      '{"op":"in","content":{"field":"access","value":["open"]}}',
+      ']}'
+    )
+    
+    # Make the API request to get file info
+    cat("Querying GDC API for available files...\n")
+    
+    # Create request manually with curl
+    query_url <- paste0(
+      files_endpt, 
+      "?filters=", URLencode(filter_json),
+      "&fields=file_id,file_name,file_size",
+      "&format=json",
+      "&size=1"
+    )
+    
+    # Make request with or without token (token should work)
+    if (!is.null(token)) {
+      headers <- c("X-Auth-Token" = token)
+      response <- httr::GET(query_url, httr::add_headers(.headers = headers))
+    } else {
+      response <- httr::GET(query_url)
+    }
+    
+    # Check response
+    if (httr::status_code(response) != 200) {
+      stop(paste("GDC API returned error code:", httr::status_code(response)))
+    }
+    
+    # Parse response
+    response_text <- httr::content(response, "text", encoding = "UTF-8")
+    response_json <- jsonlite::fromJSON(response_text)
+    
+    # Check if files found
+    if (response_json$data$pagination$total == 0) {
+      cat(sprintf("No %s data found for TCGA-%s.\n", data_type, cancer_type))
+      return(FALSE)
+    }
+    
+    # Get file info
+    file_id <- response_json$data$hits[[1]]$file_id
+    file_name <- response_json$data$hits[[1]]$file_name
+    file_size <- response_json$data$hits[[1]]$file_size
+    
+    cat(sprintf("Found file: %s (%.2f MB)\n", file_name, file_size/1024/1024))
+    
+    # Set output file if not provided
+    if (is.null(output_file)) {
+      output_file <- file_name
+    }
+    
+    # Prepare for download 
+    temp_file <- tempfile()
+    
+    # reate JSON body
+    download_body <- paste0('{"ids":["', file_id, '"]}')
+    
+    # Set headers for download
+    download_headers <- c("Content-Type" = "application/json")
+    if (!is.null(token)) {
+      download_headers <- c(download_headers, "X-Auth-Token" = token)
+    }
+    
+    # Download the file
+    cat("Downloading file...\n")
+    download_resp <- httr::POST(
+      data_endpt,
+      body = download_body,
+      httr::add_headers(.headers = download_headers),
+      httr::write_disk(temp_file, overwrite = TRUE)
+    )
+    
+    # Check download status
+    if (httr::status_code(download_resp) != 200) {
+      stop(paste("Download failed with status code:", httr::status_code(download_resp)))
+    }
+    
+    # Move temp file to output location
+    file.copy(temp_file, output_file, overwrite = TRUE)
+    unlink(temp_file)
+    
+    cat(sprintf("Successfully downloaded file to %s\n", output_file))
+    
+    # Extract if needed
+    if (grepl("\\.gz$", output_file)) {
+      cat("File is compressed. Attempting to decompress...\n")
+      if (requireNamespace("R.utils", quietly = TRUE)) {
+        uncompressed_file <- sub("\\.gz$", "", output_file)
+        R.utils::gunzip(output_file, destname = uncompressed_file)
+        cat(sprintf("Decompressed to %s\n", uncompressed_file))
+        output_file <- uncompressed_file
+      } else {
+        cat("R.utils package not available. File remains compressed.\n")
+      }
+    }
+    
+    # Process MAF file if appropriate
+    if (grepl("\\.maf$", output_file, ignore.case = TRUE)) {
+      cat("Processing MAF file to extract mutation data...\n")
+      output_tsv <- sub("\\.maf$", ".tsv", output_file, ignore.case = TRUE)
+      
+      # Safely determine how many lines to skip (comments starting with #)
+      first_lines <- readLines(output_file, n = 100)
+      comment_lines <- grep("^#", first_lines)
+      skip_lines <- ifelse(length(comment_lines) > 0, max(comment_lines), 0)
+      
+      # Read data with header
+      maf_data <- utils::read.delim(
+        output_file, 
+        skip = skip_lines, 
+        nrows = 1000,  # Limit to 1000 rows
+        stringsAsFactors = FALSE,
+        check.names = FALSE
+      )
+      
+      # Get relevant columns
+      req_columns <- c(
+        "Hugo_Symbol", "Chromosome", "Start_Position", 
+        "Reference_Allele", "Tumor_Seq_Allele2", 
+        "Variant_Classification", "Variant_Type", 
+        "Tumor_Sample_Barcode"
+      )
+      
+      found_columns <- intersect(names(maf_data), req_columns)
+      
+      if (length(found_columns) > 0) {
+        # Save subset of data
+        data_subset <- maf_data[, found_columns, drop = FALSE]
+        utils::write.table(
+          data_subset, 
+          file = output_tsv, 
+          sep = "\t", 
+          row.names = FALSE, 
+          quote = FALSE
+        )
+        cat(sprintf("Saved processed mutation data to %s\n", output_tsv))
+        return(output_tsv)
+      } else {
+        cat("Warning: Required columns not found in MAF file.\n")
+        return(output_file)
+      }
+    }
+    
+    return(output_file)
+    
+  }, error = function(e) {
+    cat(sprintf("Error downloading real TCGA data: %s\n", e$message))
+    cat("Falling back to mock data generation\n")
+    return(FALSE)
+  })
+}
+
+
+```
+
+```{r}
+# Run the pipeline
+token_file <- "gdc-token.txt"
+synthetic_data <- main(use_token = use_authentication, token_file = token_file)
+#try_fetch_real_tcga_data(cancer_type = "LUAD", token_file = 
+#"/Users/goldmael/Desktop/gdc-token.txt")
+```
+
+## Visualize results
+```{r}
+# Check if the synthetic data was generated
+if (exists("synthetic_data") && !is.null(synthetic_data)) 
+  cat("Synthetic data summary:\n")
+  cat(sprintf("Number of records: %d\n", nrow(synthetic_data)))
+  cat(sprintf("Number of unique genes: %d\n", length(unique(synthetic_data$Hugo_Symbol))))
+  cat(sprintf("Number of synthetic samples: %d\n", length(unique(synthetic_data$sample_id))))
+  
+  # Gene distribution
+  gene_counts <- synthetic_data %>%
+    count(Hugo_Symbol, sort = TRUE) %>%
+    rename(occurrences = n)
+  
+  print(gene_counts)
+  
+  # Plot gene distribution
+  if (requireNamespace("ggplot2", quietly = TRUE)) {
+    library(ggplot2)
+    
+    # Plot gene distribution
+    ggplot(gene_counts, aes(x = reorder(Hugo_Symbol, -occurrences), y = occurrences)) +
+      geom_bar(stat = "identity", fill = "steelblue") +
+      theme_minimal() +
+      labs(title = "Distribution of Genes in Synthetic Hotspot Data",
+           x = "Gene",
+           y = "Count") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    # Plot hotspot counts by gene and sample
+    ggplot(synthetic_data, aes(x = Hugo_Symbol, y = count, fill = sample_id)) +
+      geom_boxplot() +
+      theme_minimal() +
+      labs(title = "Mutation Counts by Gene Across Synthetic Samples",
+           x = "Gene",
+           y = "Mutation Count") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+            legend.position = "none")
+  } else {
+    cat("ggplot2 package not available for visualization\n")
+  }
+}
